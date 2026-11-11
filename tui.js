@@ -1,5 +1,5 @@
-// Sidebar gauges for subscription usage: Claude (5h + 7d) and every ChatGPT/Codex login stored in
-// OpenCode. Plain JS against the opentui Solid runtime, so no JSX build step is needed.
+// Sidebar gauges for subscription usage: every Claude Code login (5h + 7d) and every ChatGPT/Codex
+// login stored in OpenCode. Plain JS against the opentui Solid runtime, so no JSX build step is needed.
 // The palette, level colours, gauge layout, session provider and sidebar checks, compact text
 // and slot wiring are adapted from @davidaayers/opencode-codex-usage-plugin (MIT); see
 // THIRD_PARTY_NOTICES.md.
@@ -16,7 +16,7 @@ import {
 } from "@opentui/solid"
 import { createMemo, createSignal, onCleanup } from "solid-js"
 import { cacheState, formatCountdown, lastStep } from "./cache.js"
-import { fetchClaudeUsage } from "./claude.js"
+import { activeClaudeDir, claudeEmail, discoverClaudeAccounts, fetchClaudeUsage, switchClaudeDir } from "./claude.js"
 import { fetchCodexUsage, isCodexCredential } from "./codex.js"
 import { cachePath, formatPercent, gauge, gaugeColumns, loadUsage, shortReset, statusNote } from "./usage.js"
 
@@ -87,9 +87,20 @@ function refreshMs(api) {
   return Math.max(1, Number.isFinite(minutes) ? minutes : DEFAULT_REFRESH_MINUTES) * 60_000
 }
 
-// Claude first, then every ChatGPT login in OpenCode's credential order.
+// Every Claude Code config directory (default first), then every ChatGPT login in OpenCode's
+// credential order. Claude labels and the ✓ are set in `label` once logged-out ones are hidden.
 async function discoverAccounts(api) {
-  const accounts = [{ key: "claude", provider: CLAUDE_PROVIDER_ID, label: "Claude", fetch: fetchClaudeUsage }]
+  const activeDir = await activeClaudeDir()
+  const claude = await discoverClaudeAccounts(undefined, [activeDir, process.env.CLAUDE_CONFIG_DIR].filter(Boolean))
+  const accounts = claude.map(({ name, dir }, i) => ({
+    // discoverClaudeAccounts lists ~/.claude first; its cache keeps the single-account name.
+    key: i === 0 ? "claude" : `claude-${name}`,
+    provider: CLAUDE_PROVIDER_ID,
+    name,
+    dir,
+    active: dir === activeDir,
+    fetch: () => fetchClaudeUsage(dir),
+  }))
   let credentials = []
   try {
     const response = await api.client.credential.list()
@@ -107,6 +118,22 @@ async function discoverAccounts(api) {
     })
   }
   return accounts
+}
+
+// With one Claude login the section is just "Claude"; with several, "Claude · <name>" and a ✓ on
+// the one the Claude Agent provider uses.
+function label(accounts) {
+  const claude = accounts.filter((account) => account.provider === CLAUDE_PROVIDER_ID)
+  return accounts.map(({ name, ...account }) =>
+    account.provider === CLAUDE_PROVIDER_ID
+      ? {
+          ...account,
+          name,
+          label: claude.length > 1 ? `Claude · ${name}` : "Claude",
+          marked: account.active && claude.length > 1,
+        }
+      : account,
+  )
 }
 
 // One store shared by every view, backed by the cross-window cache files in usage.js. It only
@@ -136,10 +163,12 @@ function createStore(api) {
         ),
       )
       setAccounts(
-        discovered
-          .map(({ fetch, ...account }, i) => ({ ...account, entry: entries[i] }))
-          // Hide Claude entirely when there's no Claude Code login.
-          .filter((account) => !(account.entry.code === "no_login" && !account.entry.usage)),
+        label(
+          discovered
+            .map(({ fetch, ...account }, i) => ({ ...account, entry: entries[i] }))
+            // Hide a Claude config directory entirely when it has no Claude Code login.
+            .filter((account) => !(account.entry.code === "no_login" && !account.entry.usage)),
+        ),
       )
     })().finally(() => {
       inFlight = undefined
@@ -326,12 +355,11 @@ function SidebarView(api, store, sessionID) {
   )
 }
 
-// The account the session is using: Claude, or OpenCode's active ChatGPT login.
+// The account the session is using: the active Claude login or OpenCode's active ChatGPT login.
 function sessionAccount(accounts, providerID) {
   if (!accounts) return undefined
-  if (providerID === CLAUDE_PROVIDER_ID) return accounts.find((account) => account.provider === CLAUDE_PROVIDER_ID)
-  if (providerID === OPENAI_PROVIDER_ID) return accounts.find((account) => account.provider === OPENAI_PROVIDER_ID && account.active)
-  return undefined
+  if (providerID !== CLAUDE_PROVIDER_ID && providerID !== OPENAI_PROVIDER_ID) return undefined
+  return accounts.find((account) => account.provider === providerID && account.active)
 }
 
 function CompactView(api, store, sessionID) {
@@ -352,6 +380,54 @@ function CompactView(api, store, sessionID) {
     return `${name} ${worst.label} ${formatPercent(worst.usedPercent)}`
   }
   return h("box", { visible }, h("text", { fg: () => palette(api).muted }, text))
+}
+
+// Picks which Claude login the Claude Agent provider uses. Lists the logged-in config directories
+// with their email and usage, then sets the service's CLAUDE_CONFIG_DIR.
+async function switchClaudeAccount(api, store) {
+  const release = store.want()
+  try {
+    await store.refresh()
+    const claude = (store.accounts() ?? []).filter((account) => account.provider === CLAUDE_PROVIDER_ID)
+    if (claude.length < 2) {
+      api.ui.toast.show({
+        message: "Only one Claude login. Add one with CLAUDE_CONFIG_DIR=~/.claude-<name> claude",
+        variant: "info",
+      })
+      return
+    }
+    const emails = await Promise.all(claude.map((account) => claudeEmail(account.dir)))
+    const usage = (account) =>
+      (account.entry.usage?.windows ?? []).map((window) => `${window.label} ${formatPercent(window.usedPercent)}`).join(" · ")
+    const dir = await api.ui.dialog.select({
+      title: "Claude account",
+      current: claude.find((account) => account.active)?.dir,
+      options: claude.map((account, i) => ({
+        title: account.name,
+        value: account.dir,
+        description: [emails[i], usage(account), account.entry.error].filter(Boolean).join("  "),
+      })),
+    })
+    const target = claude.find((account) => account.dir === dir)
+    if (!target || target.active) return
+    const running = (api.data.session.list() ?? []).some((session) => api.data.session.status(session.id) === "running")
+    if (
+      running &&
+      !(await api.ui.dialog.confirm({
+        title: "Switch Claude account?",
+        message: "Switching restarts the OpenCode service and interrupts running sessions.",
+        label: { confirm: "Switch", cancel: "Cancel" },
+      }))
+    )
+      return
+    await switchClaudeDir(target.dir)
+    api.ui.toast.show({ message: `Claude Agent now uses ${target.name}`, variant: "success" })
+    await store.refresh(true)
+  } catch (error) {
+    api.ui.toast.show({ message: `Switching Claude account failed: ${error?.message ?? error}`, variant: "error" })
+  } finally {
+    release()
+  }
 }
 
 export default Plugin.define({
@@ -377,6 +453,14 @@ export default Plugin.define({
           palette: true,
           slash: { name: "subscription-usage", aliases: ["claude-usage"] },
           run: () => store.refresh(true),
+        },
+        {
+          id: "subscription-usage.claude-switch-account",
+          title: "Switch Claude account",
+          group: "Usage",
+          palette: true,
+          slash: { name: "claude-switch-account" },
+          run: () => switchClaudeAccount(api, store),
         },
       ],
     }))
